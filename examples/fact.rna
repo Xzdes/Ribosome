@@ -1,0 +1,14 @@
+# factorial in i64 — recursion, LLIT, guarded base case
+EXPORT fact _
+FUNC fact i64/1
+JZ r0 base
+MOV r1 r0
+LSUB r0 1
+CALL fact r0       # result bits land in r0; r1 survives
+LMUL r1 r0
+MOV r0 r1
+RET r0 _
+LABEL base _
+LLIT r0 1
+RET r0 _
+END _ _

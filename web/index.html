@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Ribosome — язык, который читает ИИ</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+          --dim: #8b949e; --accent: #58a6ff; --ok: #3fb950; --err: #f85149; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; color: var(--accent); }
+  header .sub { color: var(--dim); font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 12px; }
+  textarea { width: 100%; min-height: 420px; background: #0a0e14; color: var(--fg);
+             border: 1px solid var(--border); border-radius: 6px; resize: vertical;
+             font: 13px/1.45 "Cascadia Code", Consolas, monospace; padding: 10px;
+             tab-size: 4; }
+  .row { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; align-items: center; }
+  button, select, input[type=text] { background: #21262d; color: var(--fg);
+             border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px;
+             font: 13px inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  input[type=text] { cursor: text; min-width: 220px; }
+  #out { white-space: pre-wrap; font: 13px/1.45 Consolas, monospace;
+         min-height: 200px; max-height: 60vh; overflow: auto; margin: 0; }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  .drop { border: 1px dashed var(--border); border-radius: 6px; padding: 10px;
+          color: var(--dim); text-align: center; margin-top: 10px; }
+  .drop.over { border-color: var(--accent); color: var(--accent); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ribosome</h1>
+  <span class="sub">v1.0 · wasm ↔ .rna · ядро исполняется прямо на этой странице</span>
+  <span class="sub">Ctrl+Enter — запустить · дифф сравнивает интерпретатор и V8 по битам и трапам</span>
+</header>
+<main>
+  <section class="panel">
+    <div class="row">
+      <select id="examples"></select>
+      <button id="bCheck">Проверить</button>
+      <button id="bRun" class="primary">Запустить</button>
+      <button id="bDiff">Дифф ↔ V8</button>
+      <input type="text" id="call" value="add 3 4" title="функция и аргументы">
+    </div>
+    <textarea id="src" spellcheck="false"></textarea>
+    <div class="drop" id="drop">перетащи сюда .wasm — подниму его в .rna</div>
+  </section>
+  <section class="panel">
+    <div class="row">
+      <button id="bLower">Скачать .wasm</button>
+      <span class="sub" id="status"></span>
+    </div>
+    <pre id="out">готов.</pre>
+  </section>
+</main>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+
+const EXAMPLES = {
+  'add (i32)': 'EXPORT add _\nFUNC add i32/2\nIADD r0 r1\nRET r0 _\nEND _ _\n',
+  'fact (i64, рекурсия)': '# factorial in i64 — recursion, LLIT, guarded base case\nEXPORT fact _\nFUNC fact i64/1\nJZ r0 base\nMOV r1 r0\nLSUB r0 1\nCALL fact r0       # result bits land in r0; r1 survives\nLMUL r1 r0\nMOV r0 r1\nRET r0 _\nLABEL base _\nLLIT r0 1\nRET r0 _\nEND _ _\n',
+  'circle (f64)': '# circle area in f64 — DLIT, DMUL, raw MOV between float ops\nEXPORT circle _\nFUNC circle f64/1\nMOV r1 r0          # radius\nDMUL r1 r0         # r^2 (DMUL overwrites r1)\nDLIT r2 3.141592653589793\nDMUL r1 r2\nMOV r0 r1\nRET r0 _\nEND _ _\n',
+  'memsum (память)': '# fill 8 bytes with 7 at address 0, then sum them back\nMEM mem 1,4\nEXPORT memsum _\nFUNC memsum i32/0\nILIT r0 0\nILIT r1 7\nILIT r2 8\nILIT r3 0          # i\nLABEL fill_loop _\nMOV r4 r3\nILT r4 r2          # i < 8? (compare a copy)\nJZ r4 fill_done\nMOV r5 r0\nIADD r5 r3         # p + i\nIPUT8 r5,0 r1      # mem[p+i] = 7\nIADD r3 1\nJMP fill_loop _\nLABEL fill_done _\nILIT r3 0\nILIT r6 0\nLABEL sum_loop _\nMOV r4 r3\nILT r4 r2\nJZ r4 sum_done\nMOV r5 r0\nIADD r5 r3\nIGET8U r7 r5,0     # r7 = mem[p+i]\nIADD r6 r7\nIADD r3 1\nJMP sum_loop _\nLABEL sum_done _\nRET r6 _\nEND _ _\n',
+  'dispatch (CALLI)': '# indirect call through a table: table[0]=inc, table[1]=dbl\n# try apply 0 41 / apply 1 41 / apply 2 41 (traps both engines!)\nTABLE t 4\nTELEM 0 inc,dbl\nEXPORT apply _\nFUNC inc i32/1\nIADD r0 1\nRET r0 _\nEND _ _\nFUNC dbl i32/1\nIMUL r0 2\nRET r0 _\nEND _ _\nFUNC apply i32/2\nMOV r2 r1          # value\nCALLI r0 r2        # r0 = table[r0](r2)\nRET r0 _\nEND _ _\n',
+  'data (сегменты)': '# DATA preloads memory: four i32 at 16, sum them\nMEM mem 1\nDATA 16 0a000000140000001e00000028000000\nEXPORT datasum _\nFUNC datasum i32/0\nILIT r0 16\nIGET r1 r0,0\nIGET r2 r0,4\nIADD r1 r2\nIGET r2 r0,8\nIADD r1 r2\nIGET r2 r0,12\nIADD r1 r2\nRET r1 _\nEND _ _\n',
+};
+
+let W = null; // wasm instance exports
+
+function readOut() {
+  const m = new Uint8Array(W.memory.buffer);
+  const p = W.ribo_out();
+  let end = p;
+  while (m[end]) end++;
+  return new TextDecoder().decode(m.subarray(p, end));
+}
+
+function setSource(text) {
+  const bytes = new TextEncoder().encode(text);
+  const m = new Uint8Array(W.memory.buffer);
+  const p = W.ribo_in();
+  if (bytes.length + 1 > W.ribo_in_cap()) throw new Error('слишком большой исходник');
+  m.set(bytes, p);
+  m[p + bytes.length] = 0;
+}
+
+function show(obj, raw) {
+  const el = $('out');
+  if (obj && obj.ok) {
+    el.className = 'ok';
+    if (obj.value !== undefined)
+      el.textContent = `ok: ${obj.type} = ${obj.value}` + (obj.bits ? `\nбиты: ${obj.bits}` : '');
+    else el.textContent = 'ok: ' + raw;
+  } else {
+    el.className = 'err';
+    el.textContent = raw;
+  }
+}
+
+async function boot() {
+  const res = await fetch('ribo.wasm');
+  const bytes = await res.arrayBuffer();
+  const inst = await WebAssembly.instantiate(bytes, {});
+  W = inst.instance.exports;
+  const sel = $('examples');
+  for (const name of Object.keys(EXAMPLES)) {
+    const o = document.createElement('option');
+    o.textContent = name;
+    sel.appendChild(o);
+  }
+  const calls = { 'add (i32)': 'add 3 4', 'fact (i64, рекурсия)': 'fact 20',
+                  'circle (f64)': 'circle 2.0', 'memsum (память)': 'memsum',
+                  'dispatch (CALLI)': 'apply 1 41', 'data (сегменты)': 'datasum' };
+  sel.onchange = () => { $('src').value = EXAMPLES[sel.value];
+                         $('call').value = calls[sel.value] || ''; };
+  $('src').value = EXAMPLES['add (i32)'];
+  $('status').textContent = 'ядро загружено (' + (bytes.byteLength / 1024).toFixed(0) + ' КБ)';
+}
+
+$('bCheck').onclick = () => {
+  try {
+    setSource($('src').value);
+    W.ribo_do_check();
+    const raw = readOut();
+    show(JSON.parse(raw), raw);
+  } catch (e) { show(null, String(e)); }
+};
+
+$('bRun').onclick = () => {
+  try {
+    setSource($('src').value);
+    const args = new TextEncoder().encode($('call').value);
+    const m = new Uint8Array(W.memory.buffer);
+    const ap = W.ribo_args();
+    m.set(args, ap);
+    m[ap + args.length] = 0;
+    W.ribo_do_run();
+    const raw = readOut();
+    show(JSON.parse(raw), raw);
+  } catch (e) { show(null, String(e)); }
+};
+$('src').addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.key === 'Enter') $('bRun').click();
+});
+
+$('bLower').onclick = () => {
+  try {
+    setSource($('src').value);
+    const n = W.ribo_do_lower();
+    if (n <= 0) { const raw = readOut(); show(JSON.parse(raw), raw); return; }
+    const bytes = new Uint8Array(W.memory.buffer.slice(W.ribo_wasmout(), W.ribo_wasmout() + n));
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
+    a.download = 'module.wasm';
+    a.click();
+    show({ ok: true }, `ok: ${n} байт wasm — файл скачан`);
+  } catch (e) { show(null, String(e)); }
+};
+
+const drop = $('drop');
+drop.ondragover = (e) => { e.preventDefault(); drop.className = 'drop over'; };
+drop.ondragleave = () => { drop.className = 'drop'; };
+drop.ondrop = async (e) => {
+  e.preventDefault();
+  drop.className = 'drop';
+  const f = e.dataTransfer.files[0];
+  if (!f) return;
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  const m = new Uint8Array(W.memory.buffer);
+  const p = W.ribo_in();
+  m.set(bytes, p);
+  const ok = W.ribo_do_lift(bytes.length);
+  const raw = readOut();
+  if (!ok) { show(null, raw); return; }
+  $('src').value = raw;
+  show({ ok: true }, `ok: ${f.name} поднят в .rna (${bytes.length} байт wasm → ${raw.length} символов)`);
+};
+
+/* diff: interpret + lower + run under V8, compare canonical results */
+function canonInterp(o) {
+  if (o.type === 'i32' || o.type === 'i64') return o.type + ' ' + o.value;
+  if (o.type === 'f32' || o.type === 'f64') return o.type + ' ' + o.bits;
+  return 'void';
+}
+function canonV8(type, v) {
+  if (type === 'i32') return 'i32 ' + (Number(v) | 0);
+  if (type === 'i64') return 'i64 ' + BigInt(v).toString();
+  if (type === 'f32') {
+    const b = new DataView(new ArrayBuffer(4));
+    b.setFloat32(0, Number(v), true);
+    return 'f32 ' + b.getUint32(0, true).toString(16).padStart(8, '0');
+  }
+  if (type === 'f64') {
+    const b = new DataView(new ArrayBuffer(8));
+    b.setFloat64(0, Number(v), true);
+    return 'f64 ' + b.getBigUint64(0, true).toString(16).padStart(16, '0');
+  }
+  return 'void';
+}
+function parseCall(line) {
+  /* Ribosome wrappers take i64 cells: float args go in as raw bits */
+  const t = line.trim().split(/\s+/);
+  const fn = t[0];
+  const f64bits = (x) => {
+    const b = new DataView(new ArrayBuffer(8));
+    b.setFloat64(0, x, true);
+    return b.getBigInt64(0, true);
+  };
+  const args = t.slice(1).map((x) => (/[.eE]|inf|nan/.test(x) ? f64bits(Number(x)) : BigInt(x)));
+  return { fn, args };
+}
+$('bDiff').onclick = async () => {
+  try {
+    setSource($('src').value);
+    const args8 = new TextEncoder().encode($('call').value);
+    const m8 = new Uint8Array(W.memory.buffer);
+    m8.set(args8, W.ribo_args());
+    m8[W.ribo_args() + args8.length] = 0;
+    /* path 1: interpreter */
+    W.ribo_do_run();
+    const interp = JSON.parse(readOut());
+    /* path 2: lower -> instantiate under V8 */
+    const n = W.ribo_do_lower();
+    if (n <= 0) { const raw = readOut(); show(JSON.parse(raw), raw); return; }
+    const wbytes = W.memory.buffer.slice(W.ribo_wasmout(), W.ribo_wasmout() + n);
+    const inst = await WebAssembly.instantiate(wbytes, {});
+    const { fn, args } = parseCall($('call').value);
+    let v8, v8trap = null;
+    try { v8 = inst.instance.exports[fn](...args); }
+    catch (e) { v8trap = String(e && e.message || e); }
+    const ci = interp.ok ? canonInterp(interp)
+                         : 'trap: ' + (interp.error ? interp.error.message : '?');
+    const cv = v8trap ? 'trap: ' + v8trap : canonV8(interp.ok ? interp.type : 'i32', v8);
+    const same = interp.ok ? (ci === cv)
+                           : (v8trap !== null); /* оба пути должны трапать вместе */
+    $('out').className = same ? 'ok' : 'err';
+    $('out').textContent =
+      (same ? 'MATCH ✓' : 'MISMATCH ✗') +
+      `\nинтерпретатор: ${ci}\nV8 (wasm):     ${cv}`;
+  } catch (e) { show(null, String(e)); }
+};
+
+boot().catch((e) => { $('out').textContent = 'не удалось загрузить ribo.wasm: ' + e; });
+</script>
+</body>
+</html>

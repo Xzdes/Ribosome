@@ -1,0 +1,35 @@
+# fill 8 bytes with 7 at address 0, then sum them back
+MEM mem 1,4
+EXPORT memsum _
+FUNC memsum i32/0
+# fill: r0 = ptr, r1 = value 7, r2 = count 8
+ILIT r0 0
+ILIT r1 7
+ILIT r2 8
+ILIT r3 0          # i
+LABEL fill_loop _
+MOV r4 r3
+ILT r4 r2          # i < 8? (compare a copy)
+JZ r4 fill_done
+MOV r5 r0
+IADD r5 r3         # p + i
+IPUT8 r5,0 r1      # mem[p+i] = 7
+IADD r3 1
+JMP fill_loop _
+LABEL fill_done _
+# sum: r6 = total, r3 = i again
+ILIT r3 0
+ILIT r6 0
+LABEL sum_loop _
+MOV r4 r3
+ILT r4 r2
+JZ r4 sum_done
+MOV r5 r0
+IADD r5 r3
+IGET8U r7 r5,0     # r7 = mem[p+i]
+IADD r6 r7
+IADD r3 1
+JMP sum_loop _
+LABEL sum_done _
+RET r6 _
+END _ _

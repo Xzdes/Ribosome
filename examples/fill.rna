@@ -1,0 +1,18 @@
+# fill n bytes of linear memory with a value
+# r0 = pointer, r1 = byte value, r2 = count
+MEM mem 1,4
+EXPORT fill _
+FUNC fill void/3
+ILIT r3 0          # i = 0
+LABEL loop _
+MOV r4 r3
+ILT r4 r2          # i < n?  (compare a copy — ILT overwrites r4)
+JZ r4 done         # also the zero-trip guard
+MOV r5 r0
+IADD r5 r3         # p + i
+IPUT8 r5,0 r1      # mem[p+i] = value
+IADD r3 1
+JMP loop _
+LABEL done _
+RET _ _
+END _ _

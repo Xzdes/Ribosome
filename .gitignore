@@ -1,0 +1,9 @@
+build/
+build-*/
+work/
+*.wasm
+!tests/fixtures/*.wasm
+*.o
+*.obj
+*.exe
+.vscode/

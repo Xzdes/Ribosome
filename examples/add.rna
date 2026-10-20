@@ -1,0 +1,6 @@
+# add two i32 — the smallest legal module
+EXPORT add _
+FUNC add i32/2
+IADD r0 r1
+RET r0 _
+END _ _

@@ -1,0 +1,10 @@
+# circle area in f64 — DLIT, DMUL, raw MOV between float ops
+EXPORT circle _
+FUNC circle f64/1
+MOV r1 r0          # radius
+DMUL r1 r0         # r^2 (DMUL overwrites r1)
+DLIT r2 3.141592653589793
+DMUL r1 r2
+MOV r0 r1
+RET r0 _
+END _ _

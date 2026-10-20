@@ -132,7 +132,11 @@ static int check_func(RiboModule *m, RiboFunc *f, RiboDiag *diag) {
     flow = calloc(n, sizeof *flow);
     if (!flow) { ribo_diag_set(diag, "check", 0, "", "out of memory"); return 0; }
 
+    /* must-analysis: "written on EVERY path" — start at TOP (all set),
+       join at merge points is INTERSECTION; only the entry is exact */
+    for (i = 1; i < n; i++) memset(flow[i].in, 0xFF, sizeof flow[i].in);
     flow[0].reachable = 1;
+    memset(flow[0].in, 0, sizeof flow[0].in);
     for (i = 0; i < f->arity; i++) setbit(flow[0].in, (int)i);
 
     end_reachable = 0;
@@ -152,11 +156,10 @@ static int check_func(RiboModule *m, RiboFunc *f, RiboDiag *diag) {
                 size_t t = (size_t)in->imm;
                 if (t >= n) { end_reachable = 1; continue; }
                 if (!flow[t].reachable) { flow[t].reachable = 1; changed = 1; }
-                for (w = 0; w < NWORDS; w++)
-                    if ((out[w] & ~flow[t].in[w])) {
-                        flow[t].in[w] |= out[w];
-                        changed = 1;
-                    }
+                for (w = 0; w < NWORDS; w++) {
+                    uint64_t nw = flow[t].in[w] & out[w]; /* join: intersect */
+                    if (nw != flow[t].in[w]) { flow[t].in[w] = nw; changed = 1; }
+                }
                 continue;
             }
             if (in->op == OP_JZ || in->op == OP_JNZ) {
@@ -164,21 +167,19 @@ static int check_func(RiboModule *m, RiboFunc *f, RiboDiag *diag) {
                 if (t >= n) end_reachable = 1;
                 else {
                     if (!flow[t].reachable) { flow[t].reachable = 1; changed = 1; }
-                    for (w = 0; w < NWORDS; w++)
-                        if ((out[w] & ~flow[t].in[w])) {
-                            flow[t].in[w] |= out[w];
-                            changed = 1;
-                        }
+                    for (w = 0; w < NWORDS; w++) {
+                        uint64_t nw = flow[t].in[w] & out[w];
+                        if (nw != flow[t].in[w]) { flow[t].in[w] = nw; changed = 1; }
+                    }
                 }
             }
             /* fall-through */
             if (i + 1 >= n) { end_reachable = 1; continue; }
             if (!flow[i + 1].reachable) { flow[i + 1].reachable = 1; changed = 1; }
-            for (w = 0; w < NWORDS; w++)
-                if ((out[w] & ~flow[i + 1].in[w])) {
-                    flow[i + 1].in[w] |= out[w];
-                    changed = 1;
-                }
+            for (w = 0; w < NWORDS; w++) {
+                uint64_t nw = flow[i + 1].in[w] & out[w];
+                if (nw != flow[i + 1].in[w]) { flow[i + 1].in[w] = nw; changed = 1; }
+            }
         }
     } while (changed);
 

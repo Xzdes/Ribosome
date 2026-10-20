@@ -200,7 +200,11 @@ RiboWasm *ribo_wasm_parse(const uint8_t *bytes, size_t length, RiboError *error)
                 np = rd_u32(&r);
                 if (np > RIBO_MAX_ARGS) { wfail(error, "lift: func type with %u params exceeds the 8-arg limit", np); goto fail; }
                 w->types[i].nparams = (uint8_t)np;
-                for (k = 0; k < np; k++) rd_u8(&r); /* param types: cells anyway */
+                for (k = 0; k < np; k++) {
+                    int t = vt_to_t(rd_u8(&r));
+                    if (t < 0) { wfail(error, "lift: bad param type"); goto fail; }
+                    w->types[i].params[k] = (uint8_t)t;
+                }
                 nr = rd_u32(&r);
                 if (nr > 1) { wfail(error, "lift: multi-value results not supported"); goto fail; }
                 w->types[i].result = nr ? (uint8_t)vt_to_t(rd_u8(&r)) : T_VOID;
@@ -570,7 +574,9 @@ static const char *cvt_name(uint8_t op) {
     case 0xA9: return "F2IU"; case 0xAB: return "D2IU";
     case 0xAF: return "F2LU"; case 0xB1: return "D2LU";
     case 0xB2: return "I2F"; case 0xB4: return "L2F"; case 0xB6: return "D2F";
-    case 0xB8: return "I2D"; case 0xBA: return "L2D"; case 0xBB: return "F2D";
+    case 0xB7: return "I2D"; case 0xB9: return "L2D"; case 0xBB: return "F2D";
+    /* 0xB3/0xB5/0xB8/0xBA (unsigned int->float) are desugared at the
+       dispatch site: the IL has signed converts only */
     default: return NULL;
     }
 }
@@ -1002,6 +1008,27 @@ static void lift_func(Lift *l, uint32_t fidx) {
             } else if ((nm = cvt_name(op))) {
                 if (l->height == 0) { lfail(l, "stack underflow"); break; }
                 lemit(l, "%s r%u _", nm, slotreg(l, l->height - 1));
+            } else if (op == 0xB3 || op == 0xB8) { /* u32 -> f32/f64 */
+                /* zero-extend to i64 (non-negative) then signed convert:
+                   single rounding, exact */
+                if (l->height == 0) { lfail(l, "stack underflow"); break; }
+                lemit(l, "I2LU r%u _", slotreg(l, l->height - 1));
+                lemit(l, "%s r%u _", op == 0xB3 ? "L2F" : "L2D",
+                      slotreg(l, l->height - 1));
+            } else if (op == 0xB5 || op == 0xBA) { /* u64 -> f32/f64 */
+                /* branch desugar: x < 0 ? signed(x) + 2^64 : signed(x) */
+                int reg = slotreg(l, l->height - 1);
+                int ldone = l->label_n++;
+                const char *addop = op == 0xB5 ? "FADD" : "DADD";
+                if (l->height == 0) { lfail(l, "stack underflow"); break; }
+                lemit(l, "MOV r7 r%u", reg);            /* keep raw x */
+                lemit(l, "%s r%u _", op == 0xB5 ? "L2F" : "L2D", reg);
+                lemit(l, "LLT r7 0");
+                lemit(l, "JZ r7 L%d", ldone);
+                lemit(l, "%s r6 %s", op == 0xB5 ? "FLIT" : "DLIT",
+                      op == 0xB5 ? "0x1.0p64" : "0x1.0p64");
+                lemit(l, "%s r%u r6", addop, reg);
+                lemit(l, "LABEL L%d _", ldone);
             } else if (op == 0xBC || op == 0xBD || op == 0xBE || op == 0xBF) {
                 /* reinterpret: identity on raw cells — no code at all */
             } else {
@@ -1061,7 +1088,8 @@ int ribo_wasm_lift_mem(const RiboWasm *wasm, char **out_text, RiboError *error) 
         size_t noff = 0;
         while (i + len < wasm->nelems &&
                wasm->elems[i + len].off == wasm->elems[i + len - 1].off + 1 &&
-               len < 32) /* one TELEM line holds at most ~16 names */
+               len < 5) /* names can be ~95 chars: 5 fit into names[512]
+                           and keep the line under the 511-byte limit */
             len++;
         names[0] = '\0';
         for (k = 0; k < len; k++) {
@@ -1114,6 +1142,28 @@ int ribo_wasm_lift_mem(const RiboWasm *wasm, char **out_text, RiboError *error) 
     }
     *out_text = out.data;
     return 1;
+}
+
+int ribo_wasm_param_types(const RiboWasm *w, const char *func,
+                          uint8_t *types, int max) {
+    size_t i;
+    int j;
+    if (!w) return -1;
+    for (i = 0; i < w->nexports; i++) {
+        uint32_t fi, tidx;
+        const WType *t;
+        if (strcmp(w->exports[i].name, func)) continue;
+        fi = w->exports[i].func;
+        if (fi < (uint32_t)w->nimports) tidx = w->imports[fi].type;
+        else if (fi - (uint32_t)w->nimports < w->nfuncs)
+            tidx = w->funcs[fi - (uint32_t)w->nimports].type;
+        else return -1;
+        if (tidx >= w->ntypes) return -1;
+        t = &w->types[tidx];
+        for (j = 0; j < t->nparams && j < max; j++) types[j] = t->params[j];
+        return t->nparams;
+    }
+    return -1;
 }
 
 int ribo_wasm_lift(const RiboWasm *wasm, const char *out_path, RiboError *error) {

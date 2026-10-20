@@ -371,6 +371,25 @@ static int cmd_lower(int argc, char **argv) {
     return 0;
 }
 
+static int node_run(const char *wasm, const char *func, const char *rettype,
+                    const char **argstrs, size_t nargs, char *out, size_t cap);
+
+/* canon strings for f32/f64 are hex bit patterns; the wasm spec makes NaN
+   payloads/sign nondeterministic, so any two NaNs compare equal */
+static int canon_nan_equal(const char *a, const char *b, int rettype) {
+    unsigned long long ba, bb, exp_mask, man_mask;
+    char *ea, *eb;
+    if (rettype != T_F32 && rettype != T_F64) return 0;
+    if (strncmp(a, "ok ", 3) || strncmp(b, "ok ", 3)) return 0;
+    ba = strtoull(a + 3, &ea, 16);
+    bb = strtoull(b + 3, &eb, 16);
+    if (*ea || *eb) return 0;
+    if (rettype == T_F32) { exp_mask = 0x7F800000ull; man_mask = 0x007FFFFFull; }
+    else { exp_mask = 0x7FF0000000000000ull; man_mask = 0x000FFFFFFFFFFFFFull; }
+    return (ba & exp_mask) == exp_mask && (ba & man_mask) &&
+           (bb & exp_mask) == exp_mask && (bb & man_mask);
+}
+
 static int cmd_verify(int argc, char **argv) {
     RiboDiag diag;
     RiboModule *m;
@@ -378,11 +397,8 @@ static int cmd_verify(int argc, char **argv) {
     RiboError err;
     RiboValue args[RIBO_MAX_ARGS], result;
     size_t i;
-    char ours[128], cmd[2048], node_out[256];
-    FILE *fp;
+    char ours[128], node_out[256];
     const char *wasm_path = "work\\verify_tmp.wasm";
-    const char *out_path = "work\\verify_node.out";
-    int ran;
 
     if (argc < 4) return usage();
     memset(&diag, 0, sizeof diag);
@@ -431,30 +447,24 @@ static int cmd_verify(int argc, char **argv) {
         return 1;
     }
     {
-        size_t off = 0;
-        off += snprintf(cmd + off, sizeof cmd - off,
-                        "node tests\\wasm\\run.js %s %s %s", wasm_path,
-                        f->name, ret_name(f->ret));
-        for (i = 0; i < f->arity; i++)
-            off += snprintf(cmd + off, sizeof cmd - off, " %llu",
-                            (unsigned long long)args[i]);
-        snprintf(cmd + off, sizeof cmd - off, " > %s 2>&1", out_path);
+        const char *cellstr[RIBO_MAX_ARGS];
+        char cellbuf[RIBO_MAX_ARGS][32];
+        for (i = 0; i < f->arity; i++) {
+            snprintf(cellbuf[i], sizeof cellbuf[i], "%llu",
+                     (unsigned long long)args[i]);
+            cellstr[i] = cellbuf[i];
+        }
+        if (!node_run(wasm_path, f->name, ret_name(f->ret), cellstr,
+                      f->arity, node_out, sizeof node_out)) {
+            fprintf(stderr, "verify: node harness failed (is node on PATH, "
+                            "are we at the repo root?)\n");
+            ribo_module_release(m);
+            return 1;
+        }
     }
-    ran = system(cmd);
-    if (ran != 0) {
-        fprintf(stderr, "verify: node harness failed (is node on PATH, "
-                        "are we at the repo root?)\n");
-        ribo_module_release(m);
-        return 1;
-    }
-    fp = fopen(out_path, "r");
-    if (!fp) { fprintf(stderr, "verify: cannot read %s\n", out_path); ribo_module_release(m); return 1; }
-    if (!fgets(node_out, sizeof node_out, fp)) node_out[0] = '\0';
-    fclose(fp);
-    { char *nl = strpbrk(node_out, "\r\n"); if (nl) *nl = '\0'; }
 
     /* 3. compare */
-    if (!strcmp(ours, node_out)) {
+    if (!strcmp(ours, node_out) || canon_nan_equal(ours, node_out, f->ret)) {
         printf("{\"ok\":true,\"verdict\":\"match\",\"result\":\"%s\"}\n", ours);
         ribo_module_release(m);
         return 0;
@@ -508,19 +518,22 @@ static int cmd_lift(int argc, char **argv) {
    decimal-looking values to Number (see the harness). */
 static int node_run(const char *wasm, const char *func, const char *rettype,
                     const char **argstrs, size_t nargs, char *out, size_t cap) {
+    /* pipe directly, no scratch file: a shared verify_node.out under rapid
+       churn gets locked by AV real-time scans and fails the whole storm */
     char cmd[4096];
     size_t off = 0, i;
     FILE *fp;
+    int rc;
     off += snprintf(cmd + off, sizeof cmd - off, "node tests\\wasm\\run.js %s %s %s",
                     wasm, func, rettype);
     for (i = 0; i < nargs; i++)
         off += snprintf(cmd + off, sizeof cmd - off, " %s", argstrs[i]);
-    snprintf(cmd + off, sizeof cmd - off, " > work\\verify_node.out 2>&1");
-    if (system(cmd) != 0) return 0;
-    fp = fopen("work\\verify_node.out", "r");
+    snprintf(cmd + off, sizeof cmd - off, " 2>&1");
+    fp = _popen(cmd, "r");
     if (!fp) return 0;
     if (!fgets(out, (int)cap, fp)) out[0] = '\0';
-    fclose(fp);
+    rc = _pclose(fp);
+    if (rc != 0 && !out[0]) return 0; /* no output AND failed: real spawn error */
     { char *nl = strpbrk(out, "\r\n"); if (nl) *nl = '\0'; }
     return 1;
 }
@@ -542,12 +555,15 @@ static int cmd_roundtrip(int argc, char **argv) {
     size_t arity;
     const char *rna_path = "work\\roundtrip.rna";
     const char *wasm2_path = "work\\roundtrip.wasm";
+    uint8_t ptypes[RIBO_MAX_ARGS];
+    int ptype_n;
 
     if (argc < 4) return usage();
     bytes = read_file(argv[2], &len);
     if (!bytes) { fprintf(stderr, "roundtrip: cannot read file: %s\n", argv[2]); return 1; }
     w = ribo_wasm_parse(bytes, len, &err);
     if (!w) { free(bytes); fprintf(stderr, "%s\n", err.message); return 1; }
+    ptype_n = ribo_wasm_param_types(w, argv[3], ptypes, RIBO_MAX_ARGS);
     if (!ribo_wasm_lift(w, rna_path, &err)) {
         fprintf(stderr, "%s\n", err.message);
         ribo_wasm_release(w);
@@ -582,7 +598,10 @@ static int cmd_roundtrip(int argc, char **argv) {
     arity = f->arity;
     for (i = 0; i < arity; i++) {
         const char *s = argv[4 + i];
-        int ptype = (strpbrk(s, ".eE") || strstr(s, "inf") || strstr(s, "nan"))
+        /* float args are encoded by the ORIGINAL module's param type:
+           lifted f32 cells hold f32 bits, f64 cells f64 bits */
+        int ptype = ((int)i < ptype_n) ? ptypes[i]
+                    : (strpbrk(s, ".eE") || strstr(s, "inf") || strstr(s, "nan"))
                         ? T_F64 : T_I64;
         if (!parse_value(s, ptype, &args[i])) {
             fprintf(stderr, "roundtrip: bad argument: %s\n", s);
@@ -612,7 +631,7 @@ static int cmd_roundtrip(int argc, char **argv) {
         return 1;
     }
     free(bytes);
-    if (!strcmp(orig, lifted)) {
+    if (!strcmp(orig, lifted) || canon_nan_equal(orig, lifted, ret)) {
         printf("{\"ok\":true,\"verdict\":\"roundtrip-match\",\"result\":\"%s\"}\n", orig);
         return 0;
     }

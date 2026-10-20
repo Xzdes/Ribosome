@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define RIBO_VERSION "1.0.0"
+#define RIBO_VERSION "1.0.1"
 
 /* Default limits. Every limit is a runtime configuration field, never a
    baked-in constant: hosts (a browser tab, a CLI, a test harness) have
@@ -94,5 +94,10 @@ int ribo_wasm_lift(const RiboWasm *wasm, const char *out_path,
 /* In-memory lift; the caller owns *out_text (free(), NUL-terminated). */
 int ribo_wasm_lift_mem(const RiboWasm *wasm, char **out_text,
                        RiboError *error);
+/* Parameter types (T_*) of an exported function, in order. Returns the
+   arity, or -1 when the export does not exist. Needed by differential
+   harnesses to encode float arguments into i64 cells correctly. */
+int ribo_wasm_param_types(const RiboWasm *wasm, const char *func,
+                          uint8_t *types, int max);
 
 #endif

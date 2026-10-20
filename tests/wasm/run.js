@@ -17,6 +17,7 @@ const [, , file, fname, rettype, ...argstrs] = process.argv;
 function classify(msg) {
     const m = String(msg);
     if (/divide by zero/.test(m)) return 'div0';
+    if (/divide result unrepresentable/.test(m)) return 'divovf';
     if (/integer overflow/.test(m)) return 'divovf';
     if (/out of bounds/.test(m)) return 'oob';
     if (/unrepresentable|integer result/.test(m)) return 'trunc';

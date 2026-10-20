@@ -565,6 +565,8 @@ static void emit_instr(Buf *b, const RiboInstr *in, const Ctx *cx) {
             set_from_i32(b, in->dst);  /* wasm extends into i32 already */
         else if (op == OP_FGET)
             set_from_f32(b, in->dst);
+        else if (op == OP_DGET)
+            set_from_f64(b, in->dst);
         else
             set_reg(b, in->dst);       /* i64 loads arrive extended */
         return;

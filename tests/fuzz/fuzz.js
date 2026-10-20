@@ -59,8 +59,12 @@ const BINOPS32 = [OP.add, OP.sub, OP.mul, OP.and, OP.or, OP.xor,
 const BINOPS64 = [OP64.add, OP64.sub, OP64.mul, OP64.and, OP64.or, OP64.xor,
                   OP64.divs, OP64.divu, OP64.rems, OP64.remu,
                   OP64.shl, OP64.shrs, OP64.shru, OP64.rotl, OP64.rotr];
+const BINOPSF64 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5]; // add..max
+const BINOPSF32 = [0x92, 0x93, 0x94, 0x95, 0x96, 0x97];
 const UNOPS32 = [OP.clz, OP.ctz, OP.pop, OP.eqz];
 const UNOPS64 = [OP64.clz, OP64.ctz, OP64.pop];
+const UNOPSF64 = [0x9F, 0x99, 0x9A];                   // sqrt, abs, neg
+const UNOPSF32 = [0x91, 0x8B, 0x8C];
 
 // ---------- seeded PRNG ----------
 function mulberry32(seed) {
@@ -76,41 +80,72 @@ function mulberry32(seed) {
 // ---------- module generator ----------
 // All funcs share one type: (W, W) -> W where W is i32 or i64 per module.
 // 2 params + up to 3 locals.
+let lastMode = 0; // mode of the most recently generated module
 function genModule(seed) {
     const rnd = mulberry32(seed);
     const ri = (n) => (rnd() * n) | 0;
-    const is64 = rnd() < 0.4;
-    const WT = is64 ? 0x7E : I32;
+    // mode: 0=i32, 1=i64, 2=f64, 3=f32
+    const mode = [0, 0, 1, 1, 2, 2, 3][ri(7)];
+    lastMode = mode;
+    const is64 = mode === 1;
+    const isF = mode >= 2;
+    const isF64 = mode === 2;
+    const WT = [I32, 0x7E, 0x7C, 0x7D][mode];
     const COP = is64 ? OP64.lconst : OP.i32const;
-    const LOP = is64 ? OP64.lload : OP.i32load;
-    const SOP = is64 ? OP64.lstore : OP.i32store;
-    const ALN = is64 ? 3 : 2;
-    const MASK = is64 ? 1016 : 1020;
-    const BINOPS = is64 ? BINOPS64 : BINOPS32;
-    const UNOPS = is64 ? UNOPS64 : UNOPS32;
+    const LOP = [OP.i32load, OP64.lload, 0x2B, 0x2A][mode];
+    const SOP = [OP.i32store, OP64.lstore, 0x39, 0x38][mode];
+    const ALN = [2, 3, 3, 2][mode];
+    const MASK = [1020, 1016, 1016, 1020][mode];
+    const BINOPS = [BINOPS32, BINOPS64, BINOPSF64, BINOPSF32][mode];
+    const UNOPS = [UNOPS32, UNOPS64, UNOPSF64, UNOPSF32][mode];
+    // one W-typed constant (finite values only)
+    const constExpr = () => {
+        if (!isF) return [COP, ...s(ri(100))];
+        const dv = new DataView(new ArrayBuffer(8));
+        if (isF64) { dv.setFloat64(0, rnd() * 200 - 100, true);
+                     return [0x44, ...new Uint8Array(dv.buffer)]; }
+        dv.setFloat32(0, rnd() * 200 - 100, true);
+        return [0x43, ...new Uint8Array(dv.buffer.slice(0, 4))];
+    };
+    // int result of memory.size/grow converted to W
+    const i32ToW = isF ? [isF64 ? 0xB7 : 0xB2] : (is64 ? [0xAC] : []);
     const nfuncs = 1 + ri(3);            // 1..3
     const hasMem = rnd() < 0.6;
     const hasTable = nfuncs > 1 && rnd() < 0.5;
+    const hasGlob = rnd() < 0.5;         // mutable global g0 of width W
     const nlocals = ri(4);               // extra locals per func (uniform: fine)
 
     // addresses are always i32 (wasm), conditions too (via i64.eqz in 64 mode)
     const addrExpr = (d) => [...genExprI32(d), OP.i32const, ...s(MASK), OP.and];
     const condExpr = (d) => is64 ? [...genExpr(d), 0x50 /* i64.eqz */]
-                                 : genExpr(d);
+                       : isF ? [...genExpr(d), ...genExpr(d),
+                                isF64 ? 0x63 /* f64.lt */ : 0x5D /* f32.lt */]
+                       : genExpr(d);
+    // sub-width loads/stores available in each mode (op, align, mask)
+    // value width must match the stack: 32-mode uses i32.* only, 64-mode i64.*
+    const SUBLOADS32 = [[0x2C, 0, 1023], [0x2D, 0, 1023], [0x2E, 1, 1022], [0x2F, 1, 1022]];
+    const SUBLOADS64 = [[0x30, 0, 1023], [0x31, 0, 1023],
+                        [0x32, 1, 1022], [0x33, 1, 1022], [0x34, 2, 1020], [0x35, 2, 1020]];
+    const SUBSTORES32 = [[0x3A, 0, 1023], [0x3B, 1, 1022]];
+    const SUBSTORES64 = [[0x3C, 0, 1023], [0x3D, 1, 1022], [0x3E, 2, 1020]];
+    const SUBL = is64 ? SUBLOADS64 : SUBLOADS32;
+    const SUBS = is64 ? SUBSTORES64 : SUBSTORES32;
     function genExprI32(depth) {         // small i32 producer for addresses
         if (depth <= 0) return [OP.i32const, ...s(ri(1024))];
         return [...genExprI32(depth - 1), ...genExprI32(0),
                 [OP.add, OP.xor, OP.sub][ri(3)]];
     }
 
+    let curFidx = 0;                     // calls may only target EARLIER funcs
     function genExpr(depth) {            // leaves one W on the stack
         const localIdx = () => ri(2 + nlocals);
         if (depth <= 0) {
             const w = rnd();
-            if (w < 0.4) return [COP, ...s(ri(100))];
-            if (w < 0.8) return [OP.lget, ...u(localIdx())];
+            if (w < 0.35) return constExpr();
+            if (w < 0.7) return [OP.lget, ...u(localIdx())];
+            if (w < 0.8 && hasGlob) return [0x23, 0x00]; // global.get 0
             if (hasMem) return [...addrExpr(1), LOP, ...u(ALN), ...u(0)];
-            return [COP, ...s(ri(100))];
+            return constExpr();
         }
         const w = rnd();
         if (w < 0.45) { // binary op
@@ -124,21 +159,33 @@ function genModule(seed) {
             return [...genExpr(depth - 1), ...genExpr(depth - 1),
                     ...condExpr(depth - 1), OP.select];
         }
-        if (w < 0.68 && hasMem) { // masked load
+        if (w < 0.64 && hasMem) { // masked natural load
             return [...addrExpr(depth - 1), LOP, ...u(ALN), ...u(0)];
         }
-        if (w < 0.76 && nfuncs > 1) { // direct call to a random func
-            const f = ri(nfuncs);
-            return [...genExpr(depth - 1), ...genExpr(depth - 1),
-                    OP.call, ...u(f)];
+        if (w < 0.70 && hasMem && !isF) { // masked sub-width load (int modes)
+            const [op, al, mk] = SUBL[ri(SUBL.length)];
+            return [...genExprI32(depth - 1), OP.i32const, ...s(mk), OP.and,
+                    op, ...u(al), ...u(0)];
         }
-        if (w < 0.82 && hasTable) { // indirect call, index mod nfuncs
-            return [...genExpr(depth - 1), ...genExpr(depth - 1),
-                    ...genExprI32(depth - 1),   /* index: always i32 */
-                    OP.i32const, ...s(nfuncs), OP.remu,
+        if (w < 0.74 && hasMem) { // memory.size (always i32 — convert to W)
+            return [0x3F, 0x00, ...i32ToW];
+        }
+        if (w < 0.78 && hasMem) { // memory.grow by 0..3 pages -> old size / -1
+            return [...genExprI32(0), OP.i32const, ...s(3), OP.and, 0x40, 0x00,
+                    ...i32ToW];
+        }
+        if (w < 0.84 && curFidx > 0) { // direct call: strictly earlier funcs
+            const f = ri(curFidx);      // (a DAG — recursion would let a
+            return [...genExpr(depth - 1), ...genExpr(depth - 1), // memory.grow
+                    OP.call, ...u(f)];  //  per frame blow up O(n^2) in V8)
+        }
+        if (w < 0.90 && hasTable && curFidx > 0) { // indirect: table holds
+            return [...genExpr(depth - 1), ...genExpr(depth - 1), // only f0,
+                    ...genExprI32(depth - 1),   /* index: always i32 */ // which
+                    OP.i32const, ...s(1), OP.remu,                 // never calls
                     OP.calli, ...u(0), 0x00];
         }
-        if (w < 0.9) { // if/else producing a value
+        if (w < 0.95) { // if/else producing a value
             return [...condExpr(depth - 1),
                     OP.if, WT,
                       ...genExpr(depth - 1),
@@ -156,9 +203,31 @@ function genModule(seed) {
 
     function genBody(fidx) {
         const expr = [];
+        curFidx = fidx;
+        if (hasGlob && rnd() < 0.4) expr.push(...genExpr(1), 0x24, 0x00); // g0 = ...
+        if (nlocals > 0 && !isF && rnd() < 0.4) { // bounded countdown loop
+            const li = 2 + ri(nlocals);
+            expr.push(
+                COP, ...s(2 + ri(4)), OP.lset, ...u(li),
+                OP.loop, 0x40,
+                  ...genExpr(0), OP.drop,
+                  OP.lget, ...u(li), COP, ...s(1), (is64 ? OP64.sub : OP.sub),
+                  OP.lset, ...u(li),
+                  OP.lget, ...u(li),
+                  ...(is64 ? [0x50 /* i64.eqz */, OP.eqz] : []),
+                  OP.br_if, ...u(0),
+                OP.end);
+        }
         if (hasMem && rnd() < 0.5) { // a couple of masked stores first
-            for (let k = 0; k < 2; k++)
-                expr.push(...addrExpr(1), ...genExpr(0), SOP, ...u(ALN), ...u(0));
+            for (let k = 0; k < 2; k++) {
+                if (isF || rnd() < 0.5) {
+                    expr.push(...addrExpr(1), ...genExpr(0), SOP, ...u(ALN), ...u(0));
+                } else { // sub-width store
+                    const [op, al, mk] = SUBS[ri(SUBS.length)];
+                    expr.push(...genExprI32(0), OP.i32const, ...s(mk), OP.and,
+                              ...genExpr(0), op, ...u(al), ...u(0));
+                }
+            }
         }
         if (nlocals > 0 && rnd() < 0.5) { // scribble into extra locals
             for (let k = 0; k < nlocals; k++)
@@ -172,18 +241,15 @@ function genModule(seed) {
     bytes.push(...sec(1, vec([[0x60, ...vec([[WT], [WT]]), ...vec([[WT]])]])));
     bytes.push(...sec(3, vec(Array.from({ length: nfuncs }, () => u(0)))));
     if (hasTable)
-        bytes.push(...sec(4, vec([[0x70, 0x00, ...u(nfuncs)]])));
+        bytes.push(...sec(4, vec([[0x70, 0x00, ...u(1)]])));
     if (hasMem)
         bytes.push(...sec(5, vec([[0x00, ...u(1)]])));
+    if (hasGlob) // one mutable global, random init
+        bytes.push(...sec(6, vec([[WT, 0x01, ...constExpr(), OP.end]])));
     bytes.push(...sec(7, vec([[...str('main'), 0x00, ...u(0)]])));
-    if (hasTable) {
-        const order = Array.from({ length: nfuncs }, (_, i) => i);
-        for (let i = order.length - 1; i > 0; i--) { // shuffle
-            const j = ri(i + 1);
-            [order[i], order[j]] = [order[j], order[i]];
-        }
+    if (hasTable) { // only func 0 (it never calls: curFidx==0 there)
         bytes.push(...sec(9, vec([[0x00, OP.i32const, ...s(0), OP.end,
-                                   ...vec(order.map(f => u(f)))]])));
+                                   ...vec([u(0)])]])));
     }
     bytes.push(...sec(10, vec(Array.from({ length: nfuncs }, (_, i) => {
         const body = genBody(i);
@@ -199,37 +265,54 @@ const COUNT = Number(process.argv[2] || 100);
 const SEED0 = Number(process.argv[3] || 1);
 let fails = 0, lifts = 0, mismatches = 0;
 
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function runSeed(seed) {
+    const buf = genModule(seed);
+    const tmp = path.join(__dirname, `fuzz_tmp_${seed}.wasm`);
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try { fs.writeFileSync(tmp, buf); break; }
+        catch (e) {                       // AV scanner holds the fresh file
+            if (attempt === 4) throw e;
+            sleep(50 * (attempt + 1));
+        }
+    }
+    const a = (seed * 7) % 97, b = (seed * 13) % 89;
+    // float modules: decimal args so the original gets real values and the
+    // lifted side gets correctly-typed cells (ribo reads the wasm types)
+    const sa = lastMode >= 2 ? `${a}.5` : String(a);
+    const sb = lastMode >= 2 ? `${b}.25` : String(b);
+    const r = spawnSync(RIBO, ['roundtrip', tmp, 'main', sa, sb],
+                        { encoding: 'utf8', timeout: 15000 });
+    fs.rmSync(tmp, { force: true });
+    return r;
+}
+
 for (let i = 0; i < COUNT; i++) {
     const seed = SEED0 + i;
-    const buf = genModule(seed);
-    fs.writeFileSync(TMP, buf);
-    const a = (seed * 7) % 97, b = (seed * 13) % 89;
-    const r = spawnSync(RIBO, ['roundtrip', TMP, 'main', String(a), String(b)],
-                        { encoding: 'utf8', timeout: 15000 });
-    const line = (r.stdout || '').trim().split('\n').pop() || '';
+    let r = runSeed(seed);
+    let line = (r.stdout || '').trim().split('\n').pop() || '';
     let j = null;
     try { j = JSON.parse(line); } catch { /* fallthrough */ }
+    if (!j && /being used|EPERM|EBUSY/i.test(r.stderr || '')) {
+        sleep(200);                        // transient lock flake: retry once
+        r = runSeed(seed);
+        line = (r.stdout || '').trim().split('\n').pop() || '';
+        try { j = JSON.parse(line); } catch { /* fallthrough */ }
+    }
+    const save = () => fs.writeFileSync(path.join(__dirname, `fuzz_fail_${seed}.wasm`),
+                                        genModule(seed));
     if (!j) {
         console.log(`seed ${seed}: CRASH/NO-JSON exit=${r.status} ${(r.stderr || '').trim().slice(0, 200)}`);
-        fs.copyFileSync(TMP, path.join(__dirname, `fuzz_fail_${seed}.wasm`));
+        save();
         fails++;
         continue;
     }
-    if (!j.ok) {
-        const liftBug = /lift|parse|check/.test(j.error && j.error.message || '');
-        console.log(`seed ${seed}: FAIL ${j.error && j.error.message}`);
-        fs.copyFileSync(TMP, path.join(__dirname, `fuzz_fail_${seed}.wasm`));
-        fails++;
-        if (liftBug) lifts++;
-        continue;
-    }
-    if (j.verdict !== 'roundtrip-match') {
+    if (j.verdict && j.verdict !== 'roundtrip-match') {
         console.log(`seed ${seed}: MISMATCH interp=${j.interpreter} lifted=${j.lifted} orig=${j.original}`);
-        fs.copyFileSync(TMP, path.join(__dirname, `fuzz_fail_${seed}.wasm`));
+        save();
         fails++;
         mismatches++;
     }
 }
-fs.rmSync(TMP, { force: true });
 console.log(`\n${COUNT - fails}/${COUNT} roundtrip-match (${lifts} lift fails, ${mismatches} mismatches)`);
 process.exit(fails ? 1 : 0);

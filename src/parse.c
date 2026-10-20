@@ -899,16 +899,24 @@ int ribo_parse_source(const char *text, int repair, RiboModule **out,
         module_free(m);
         return 0;
     }
-    buf = malloc(strlen(text) + 1);
+    buf = malloc(strlen(text) + 2);
     if (!buf) { module_free(m); ribo_diag_set(diag, "parse", 0, "", "out of memory"); return 0; }
     strcpy(buf, text);
+    buf[strlen(text)] = '\n';   /* sentinel: the last line always terminates */
+    buf[strlen(text) + 1] = '\0';
+    (void)save;
 
-    for (line = strtok_s(buf, "\n", &save); line; line = strtok_s(NULL, "\n", &save)) {
+    {
+        char *next = buf;
+        for (line = buf; *line; line = next) {
         char raw[512];
+        char *eol = strchr(line, '\n');
         char *f[3];
         char *hash, *cr;
         int nf;
+        next = eol ? eol + 1 : line + strlen(line);
         lineno++;
+        if (eol) *eol = '\0';
         cr = strchr(line, '\r');
         if (cr) *cr = '\0';
         if (strlen(line) > 511) {
@@ -947,6 +955,7 @@ int ribo_parse_source(const char *text, int repair, RiboModule **out,
                 if (!resolve_jumps_at_end(&p, &m->funcs[m->func_count - 1]))
                     goto fail;
             }
+        }
         }
     }
     if (cur) {

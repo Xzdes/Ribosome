@@ -316,9 +316,26 @@ scratch: CALL/CALLI results land in r0), blocks become LABEL/JMP pairs. wasm
 shift counts are masked by the lifter (IAND/LAND before ISHL...) to preserve
 semantics; rotations and clz/ctz/popcnt map 1:1. Tables become TABLE/TELEM,
 call_indirect becomes CALLI, active data segments become DATA lines.
-Lifter limits: no passive/declared element segments, no passive data, no
-multi-value, one memory, one table, function imports only, arity ≤ 8,
-register budget 256.
+Unsigned int->float converts (0xB3/0xB5/0xB8/0xBA) are desugared: u32 zero-
+extends to i64 first (exact, single rounding); u64 branches on the sign and
+adds 2^64 when negative. Lifter limits: no passive/declared element segments,
+no passive data, no multi-value, one memory, one table, function imports
+only, arity ≤ 8, register budget 256.
+
+## NaN determinism (verify/roundtrip)
+
+The wasm spec leaves NaN payloads and signs nondeterministic. verify and
+roundtrip compare f32/f64 results as raw bits, EXCEPT: two NaNs always
+compare equal (any payload, any sign). Chain that produce NaN (sqrt of a
+negative, inf - inf, 0/0.0) are therefore engine-portable in the verdict.
+
+## CLI/CSV argument encoding
+
+Integer-looking args become i64 cells; decimal/`inf`/`nan` args become f64
+bit cells. In `roundtrip` the cells are encoded by the ORIGINAL module's
+param types (f32 params get f32 bits), so any wasm function works. For
+hand-written .rna, f32 funcs take f32 bit patterns as integers (params have
+no declared types — the cell convention rules).
 
 Limits (defaults; every one is runtime-configurable): 256 registers per func,
 8 call arguments, call depth 1024, step budget 10 000 000 per invocation,

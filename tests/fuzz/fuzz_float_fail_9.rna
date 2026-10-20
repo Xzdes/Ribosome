@@ -1,0 +1,13 @@
+EXPORT f _
+FUNC f f64/0
+DLIT r0 -71.64677866
+D2F r0 _
+F2D r0 _
+D2F r0 _
+F2D r0 _
+DSQRT r0 _
+DLIT r1 26.45810405
+DMIN r0 r1
+DSQRT r0 _
+RET r0 _
+END _ _
